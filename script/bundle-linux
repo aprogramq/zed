@@ -3,6 +3,10 @@
 set -euxo pipefail
 source script/lib/blob-store.sh
 
+local_install=false
+build_remote=true
+fast_build=false
+
 # Function for displaying help info
 help_info() {
   echo "
@@ -12,6 +16,11 @@ Build a release .tar.gz for Linux.
 Options:
   -h, --help     Display this help and exit.
   --flatpak      Set ZED_BUNDLE_TYPE=flatpak so that this can be included in system info
+  --local        Install locally to ~/.local (skips sentry, stripping, archive).
+                 Also installs .desktop to /usr/share/applications/.
+  --remote       Build remote_server (default: enabled).
+  --no-remote    Skip building remote_server.
+  --fast         Use release-fast profile (faster compilation, slightly slower runtime).
   "
 }
 
@@ -24,6 +33,22 @@ while [[ $# -gt 0 ]]; do
             ;;
         --flatpak)
             export ZED_BUNDLE_TYPE=flatpak
+            shift
+            ;;
+        --local)
+            local_install=true
+            shift
+            ;;
+        --remote)
+            build_remote=true
+            shift
+            ;;
+        --no-remote)
+            build_remote=false
+            shift
+            ;;
+        --fast)
+            fast_build=true
             shift
             ;;
         --)
@@ -45,6 +70,23 @@ done
 
 export ZED_BUNDLE=true
 
+# Setup sccache if available
+if command -v sccache >/dev/null 2>&1; then
+    export RUSTC_WRAPPER=sccache
+    export SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-20G}"
+    echo "Using sccache (cache size: ${SCCACHE_CACHE_SIZE})"
+fi
+
+# Detect fastest available linker (mold > lld)
+linker=""
+if command -v mold >/dev/null 2>&1; then
+    linker="mold"
+    echo "Linker: mold"
+elif command -v lld >/dev/null 2>&1; then
+    linker="lld"
+    echo "Linker: lld"
+fi
+
 channel=$(<crates/zed/RELEASE_CHANNEL)
 target_dir="${CARGO_TARGET_DIR:-target}"
 
@@ -65,9 +107,11 @@ if command -v rustup >/dev/null 2>&1; then
 fi
 
 # Generate the licenses first, so they can be baked into the binaries
-script/generate-licenses
+if [[ "$local_install" == "false" ]]; then
+    script/generate-licenses
+fi
 
-if "$rustup_installed"; then
+if "$rustup_installed" && [[ "$build_remote" == "true" ]]; then
     rustup target add "$remote_server_triple"
 fi
 
@@ -78,20 +122,28 @@ export CC=${CC:-$(which clang)}
 # NOTE: Since RUSTFLAGS env var overrides all .cargo/config.toml rustflags
 # (see https://github.com/rust-lang/cargo/issues/5376), the
 # [target.aarch64-unknown-linux-gnu] section in config.toml has no effect here.
-if [[ "$(uname -m)" == "aarch64" ]]; then
-    export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-fuse-ld=lld -C link-args=-Wl,--disable-new-dtags,-rpath,\$ORIGIN/../lib"
-else
-    export RUSTFLAGS="${RUSTFLAGS:-} -C link-args=-Wl,--disable-new-dtags,-rpath,\$ORIGIN/../lib"
+rustflags_linker=""
+if [ -n "$linker" ]; then
+    rustflags_linker="-C link-arg=-fuse-ld=${linker}"
 fi
-cargo build --release --target "${target_triple}" --package zed --package cli
-# Build remote_server in separate invocation to prevent feature unification from other crates
-# from influencing dynamic libraries required by it.
-if [[ "$remote_server_triple" == "$musl_triple" ]]; then
-    export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static"
-fi
-cargo build --release --target "${remote_server_triple}" --package remote_server
+export RUSTFLAGS="${RUSTFLAGS:-} ${rustflags_linker} -C link-args=-Wl,--disable-new-dtags,-rpath,\$ORIGIN/../lib"
 
-# Upload debug info to sentry.io
+if [[ "$fast_build" == "true" ]]; then
+    profile="release-fast"
+else
+    profile="release"
+fi
+cargo build --profile "${profile}" --target "${target_triple}" --package zed --package cli
+# Build remote_server if requested
+if [[ "$build_remote" == "true" ]]; then
+    if [[ "$remote_server_triple" == "$musl_triple" ]]; then
+        export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static"
+    fi
+    cargo build --profile "${profile}" --target "${remote_server_triple}" --package remote_server
+fi
+
+# Upload debug info to sentry.io (skip for local installs)
+if [[ "$local_install" == "false" ]]; then
 if ! command -v sentry-cli >/dev/null 2>&1; then
     echo "sentry-cli not found. skipping sentry upload."
     echo "install with: 'curl -sL https://sentry.io/get-cli | bash'"
@@ -118,21 +170,26 @@ else
         echo "missing SENTRY_AUTH_TOKEN. skipping sentry upload."
     fi
 fi
+fi
 
-# Strip debug symbols and save them for upload to DigitalOcean.
+# Strip debug symbols (skip for local installs)
+if [[ "$local_install" == "false" ]]; then
 # We use llvm-objcopy because GNU objcopy on older distros (e.g. Ubuntu 20.04)
 # doesn't understand CREL sections produced by newer LLVM.
 llvm-objcopy --strip-debug "${target_dir}/${target_triple}/release/zed"
 llvm-objcopy --strip-debug "${target_dir}/${target_triple}/release/cli"
 llvm-objcopy --strip-debug "${target_dir}/${remote_server_triple}/release/remote_server"
+fi
 
 # Ensure that remote_server does not depend on libssl nor libcrypto, as we got rid of these deps.
-if ldd "${target_dir}/${remote_server_triple}/release/remote_server" | grep -q 'libcrypto\|libssl'; then
+if [[ "$build_remote" == "true" ]]; then
+if ldd "${target_dir}/${remote_server_triple}/${profile}/remote_server" | grep -q 'libcrypto\|libssl'; then
     if [[ "$remote_server_triple" == *-musl ]]; then
         echo "Error: remote_server still depends on libssl or libcrypto" && exit 1
     else
         echo "Info: Using non-musl remote-server build."
     fi
+fi
 fi
 
 suffix=""
@@ -147,14 +204,14 @@ zed_dir="${temp_dir}/zed$suffix.app"
 
 # Binary
 mkdir -p "${zed_dir}/bin" "${zed_dir}/libexec"
-cp "${target_dir}/${target_triple}/release/zed" "${zed_dir}/libexec/zed-editor"
-cp "${target_dir}/${target_triple}/release/cli" "${zed_dir}/bin/zed"
+cp "${target_dir}/${target_triple}/${profile}/zed" "${zed_dir}/libexec/zed-editor"
+cp "${target_dir}/${target_triple}/${profile}/cli" "${zed_dir}/bin/zed"
 
 # Libs
 # Bundle libstdc++ so older supported systems can run binaries built with our
 # toolchain even when their system libstdc++.so.6 lacks required GLIBCXX symbols.
 find_libs() {
-    ldd ${target_dir}/${target_triple}/release/zed |\
+    ldd ${target_dir}/${target_triple}/${profile}/zed |\
         cut -d' ' -f3 |\
         grep -v '\<\(libc.so\|libgcc_s.so\|libm.so\|libpthread.so\|libdl.so\|libasound.so\)'
 }
@@ -193,15 +250,43 @@ envsubst < "crates/zed/resources/zed.desktop.in" > "${zed_dir}/share/application
 chmod +x "${zed_dir}/share/applications/$APP_ID.desktop"
 
 # Copy generated licenses so they'll end up in archive too
-cp "assets/licenses.md" "${zed_dir}/licenses.md"
+if [ -f "assets/licenses.md" ]; then
+    cp "assets/licenses.md" "${zed_dir}/licenses.md"
+fi
 
 # Create archive out of everything that's in the temp directory
 arch=$(uname -m)
 archive="zed-linux-${arch}.tar.gz"
 
-rm -rf "${archive}"
-remove_match="zed(-[a-zA-Z0-9]+)?-linux-$(uname -m)\.tar\.gz"
-ls "${target_dir}/release" | grep -E ${remove_match} | xargs -d "\n" -I {} rm -f "${target_dir}/release/{}" || true
-tar -czvf "${target_dir}/release/$archive" -C ${temp_dir} "zed$suffix.app"
+if [[ "$local_install" == "true" ]]; then
+    # Install locally to ~/.local
+    rm -rf "$HOME/.local/zed$suffix.app"
+    cp -r "$zed_dir" "$HOME/.local/zed$suffix.app"
 
-gzip -f --stdout --best "${target_dir}/${remote_server_triple}/release/remote_server" > "${target_dir}/zed-remote-server-linux-${arch}.gz"
+    mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"
+    ln -sf "$HOME/.local/zed$suffix.app/bin/zed" "$HOME/.local/bin/zed"
+
+    cp "$zed_dir/share/applications/$APP_ID.desktop" "$HOME/.local/share/applications/$APP_ID.desktop"
+    sed -i "s|Icon=zed|Icon=$HOME/.local/zed$suffix.app/share/icons/hicolor/512x512/apps/zed.png|g" "$HOME/.local/share/applications/$APP_ID.desktop"
+    sed -i "s|Exec=zed|Exec=$HOME/.local/zed$suffix.app/bin/zed|g" "$HOME/.local/share/applications/$APP_ID.desktop"
+
+    sudo mkdir -p /usr/share/applications
+    sudo cp "$zed_dir/share/applications/$APP_ID.desktop" /usr/share/applications/$APP_ID.desktop
+    sudo sed -i "s|Icon=zed|Icon=$HOME/.local/zed$suffix.app/share/icons/hicolor/512x512/apps/zed.png|g" /usr/share/applications/$APP_ID.desktop
+    sudo sed -i "s|Exec=zed|Exec=$HOME/.local/zed$suffix.app/bin/zed|g" /usr/share/applications/$APP_ID.desktop
+
+    if [[ "$build_remote" == "true" ]]; then
+        cp "${target_dir}/${remote_server_triple}/${profile}/remote_server" "$HOME/.local/zed$suffix.app/libexec/zed-remote-server"
+    fi
+
+    echo "Zed installed locally. Run with 'zed'."
+else
+    rm -rf "${archive}"
+    remove_match="zed(-[a-zA-Z0-9]+)?-linux-$(uname -m)\.tar\.gz"
+    ls "${target_dir}/${profile}" | grep -E ${remove_match} | xargs -d "\n" -I {} rm -f "${target_dir}/${profile}/{}" || true
+    tar -czvf "${target_dir}/${profile}/$archive" -C ${temp_dir} "zed$suffix.app"
+
+    if [[ "$build_remote" == "true" ]]; then
+        gzip -f --stdout --best "${target_dir}/${remote_server_triple}/${profile}/remote_server" > "${target_dir}/zed-remote-server-linux-${arch}.gz"
+    fi
+fi
